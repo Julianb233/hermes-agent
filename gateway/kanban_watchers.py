@@ -784,6 +784,22 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        active_profile = ""
+        try:
+            active_profile = (self._active_profile_name() or "").strip().lower()
+        except Exception:
+            active_profile = ""
+        orchestrator_profile = (
+            str(kanban_cfg.get("orchestrator_profile") or "").strip().lower()
+        )
+        if orchestrator_profile and active_profile != orchestrator_profile:
+            logger.info(
+                "kanban dispatcher: profile %s is not orchestrator_profile=%s; "
+                "this gateway will NOT dispatch.",
+                active_profile or "<unknown>",
+                orchestrator_profile,
+            )
+            return
 
         try:
             from hermes_cli import kanban_db as _kb

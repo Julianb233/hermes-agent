@@ -186,6 +186,40 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     )
 
 
+def _dispatcher_lock_state() -> tuple[Path, str]:
+    """Return ``(lock_path, state)`` for the embedded dispatcher lock.
+
+    ``state`` is ``"held"`` when another process owns the advisory lock,
+    ``"free"`` when this process can take and immediately release it, and
+    ``"unavailable"`` when the platform cannot perform the non-blocking probe.
+    The caller should only refuse work on ``"held"``; unavailable locking falls
+    back to the existing config controls.
+    """
+    lock_path = kb.kanban_home() / "kanban" / ".dispatcher.lock"
+    try:
+        from gateway.status import _release_file_lock, _try_acquire_file_lock
+    except Exception:
+        return lock_path, "unavailable"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(str(lock_path), "a+", encoding="utf-8")
+    except OSError:
+        return lock_path, "unavailable"
+    try:
+        if not _try_acquire_file_lock(handle):
+            handle.close()
+            return lock_path, "held"
+        _release_file_lock(handle)
+        handle.close()
+        return lock_path, "free"
+    except Exception:
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return lock_path, "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
@@ -646,6 +680,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+    p_disp.add_argument("--force", action="store_true",
+                        help="Run even when the gateway dispatcher lock is held")
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -2115,6 +2151,25 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    if not getattr(args, "force", False):
+        lock_path, lock_state = _dispatcher_lock_state()
+        if lock_state == "held":
+            msg = (
+                "Kanban dispatch is already owned by the gateway embedded "
+                f"dispatcher lock at {lock_path}. Refusing a manual one-shot "
+                "dispatch to avoid duplicate task execution. Use "
+                "`hermes kanban dispatch --force` only for maintenance."
+            )
+            if getattr(args, "json", False):
+                print(json.dumps({
+                    "error": "dispatcher_lock_held",
+                    "lock_path": str(lock_path),
+                    "hint": "rerun with --force only for maintenance",
+                }, indent=2))
+            else:
+                print(msg, file=sys.stderr)
+            return 2
+
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
