@@ -43,6 +43,26 @@ class TestBlueBubblesConfigLoading:
         assert bc.extra["require_mention"] is True
         assert bc.extra["mention_patterns"] == ["(?i)^amos\\b"]
 
+    def test_read_receipts_default_off(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_SEND_READ_RECEIPTS", raising=False)
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.send_read_receipts is False
+
+    @pytest.mark.parametrize("value", [False, "false", "0", "no", "off"])
+    def test_read_receipts_false_values_stay_off(self, monkeypatch, value):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=value)
+        assert adapter.send_read_receipts is False
+
+    @pytest.mark.parametrize("value", [True, "true", "1", "yes", "on"])
+    def test_read_receipts_true_values_opt_in(self, monkeypatch, value):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=value)
+        assert adapter.send_read_receipts is True
+
+    def test_env_can_explicitly_enable_read_receipts(self, monkeypatch):
+        monkeypatch.setenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true")
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.send_read_receipts is True
+
     def test_home_channel_set_from_env(self, monkeypatch):
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
         monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "secret")
@@ -261,6 +281,68 @@ class TestBlueBubblesMentionGating:
 
         assert response.status == 200
         assert [event.text for event in handled] == ["hello from a dm"]
+
+
+class TestBlueBubblesReadReceipts:
+    @pytest.mark.asyncio
+    async def test_default_does_not_mark_inbound_message_read(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        marked_read = []
+
+        async def fake_handle_message(_event):
+            return None
+
+        async def fake_mark_read(chat_id):
+            marked_read.append(chat_id)
+            return True
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "mark_read", fake_mark_read)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-unread",
+                "text": "keep this unread",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert marked_read == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_opt_in_marks_inbound_message_read(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=True)
+        marked_read = []
+
+        async def fake_handle_message(_event):
+            return None
+
+        async def fake_mark_read(chat_id):
+            marked_read.append(chat_id)
+            return True
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "mark_read", fake_mark_read)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-read",
+                "text": "mark this read",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert marked_read == ["iMessage;-;user@example.com"]
 
 
 class TestBlueBubblesWebhookParsing:

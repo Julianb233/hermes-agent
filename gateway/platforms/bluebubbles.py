@@ -73,15 +73,31 @@ _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_SENSITIVE_QUERY_RE = re.compile(
+    r"([?&](?:password|token|secret|api[_-]?key)=)[^&\s'\"]+",
+    flags=re.I,
+)
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
 
 
 def _redact(text: str) -> str:
-    """Redact phone numbers and emails from log output."""
+    """Redact personal identifiers and URL credentials from log output."""
+    text = _SENSITIVE_QUERY_RE.sub(r"\1[REDACTED]", text)
     text = _PHONE_RE.sub("[REDACTED]", text)
     text = _EMAIL_RE.sub("[REDACTED]", text)
     return text
+
+
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse config booleans without treating the string ``false`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +156,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         )
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
-        self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        _send_read_receipts = extra.get("send_read_receipts")
+        if _send_read_receipts is None:
+            _send_read_receipts = os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS")
+        # Safe default: preserve the native unread state and notification until
+        # an operator explicitly opts into automated read receipts.  The
+        # gateway authorization decision happens after webhook ingestion, so
+        # eagerly marking here can otherwise consume a notification for a
+        # message that the gateway subsequently rejects.
+        self.send_read_receipts = _as_bool(_send_read_receipts, default=False)
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
@@ -841,7 +865,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             logger.warning(
                 "[bluebubbles] failed to download attachment %s: %s",
                 _redact(att_guid),
-                exc,
+                _redact(str(exc)),
             )
             return None
 
