@@ -3554,6 +3554,48 @@ def test_cli_create_no_warn_unassigned(kanban_home, monkeypatch, capsys):
     assert "hermes gateway start" not in err
 
 
+def test_cli_dispatch_refuses_when_gateway_dispatcher_lock_is_held(
+    kanban_home, monkeypatch, capsys
+):
+    """A manual one-shot dispatch must not race the embedded gateway dispatcher."""
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setattr(
+        kb_cli,
+        "_dispatcher_lock_state",
+        lambda: (kanban_home / "kanban" / ".dispatcher.lock", "held"),
+        raising=False,
+    )
+    ns = argparse.Namespace(
+        dry_run=False,
+        max=None,
+        failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+        json=False,
+        force=False,
+    )
+
+    rc = kb_cli._cmd_dispatch(ns)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "gateway" in err.lower()
+    assert "--force" in err
+
+
+def test_cli_dispatch_parser_accepts_force_override():
+    """The maintenance escape hatch must be explicit on `kanban dispatch`."""
+    import argparse as _ap
+    from hermes_cli import kanban as kb_cli
+
+    root = _ap.ArgumentParser()
+    subs = root.add_subparsers(dest="cmd")
+    kb_cli.build_parser(subs)
+
+    parsed = root.parse_args(["kanban", "dispatch", "--force"])
+
+    assert parsed.force is True
+
+
 def test_cli_daemon_without_force_prints_deprecation_exits_2(kanban_home, capsys):
     """`hermes kanban daemon` (no --force) is a deprecation stub."""
     from hermes_cli import kanban as kb_cli
@@ -3619,6 +3661,41 @@ def test_gateway_dispatcher_watcher_respects_config_flag_off(monkeypatch):
         _cfg_mod, "load_config",
         lambda: {"kanban": {"dispatch_in_gateway": False}},
     )
+    asyncio.run(
+        asyncio.wait_for(
+            runner._kanban_dispatcher_watcher(),
+            timeout=3.0,
+        )
+    )
+
+
+def test_gateway_dispatcher_watcher_respects_orchestrator_profile(monkeypatch):
+    """Only kanban.orchestrator_profile may host the embedded dispatcher."""
+    import asyncio
+    from gateway import kanban_watchers as watchers
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._active_profile_name = lambda: "saltinbound"
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "orchestrator_profile": "saltmanager",
+            }
+        },
+    )
+
+    def _lock_must_not_be_taken(_path):
+        raise AssertionError("non-orchestrator gateway attempted dispatch lock")
+
+    monkeypatch.setattr(watchers, "_acquire_singleton_lock", _lock_must_not_be_taken)
+
     asyncio.run(
         asyncio.wait_for(
             runner._kanban_dispatcher_watcher(),
@@ -3937,6 +4014,46 @@ def test_complete_with_cross_worker_card_is_rejected(kanban_home):
                 created_cards=[other],
             )
         assert excinfo.value.phantom == [other]
+    finally:
+        conn.close()
+
+
+def test_complete_preserves_metadata_artifacts_as_task_attachments(
+    kanban_home, tmp_path
+):
+    """Completion artifacts must survive scratch cleanup as durable attachments."""
+    conn = kb.connect()
+    try:
+        artifact = tmp_path / "deliverable.md"
+        artifact.write_text("# Deliverable\n\nClient-ready proof.\n", encoding="utf-8")
+        task_id = kb.create_task(conn, title="produce deliverable", assignee="saltinbound")
+        assert kb.claim_task(conn, task_id) is not None
+
+        ok = kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+        assert ok is True
+        attachments = kb.list_attachments(conn, task_id)
+        assert len(attachments) == 1
+        stored = Path(attachments[0].stored_path)
+        assert stored.parent == kb.task_attachments_dir(task_id)
+        assert stored.name == artifact.name
+        assert stored.read_text(encoding="utf-8") == artifact.read_text(encoding="utf-8")
+
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.metadata["artifacts"] == [str(stored)]
+        assert run.metadata["source_artifacts"] == [str(artifact)]
+
+        completed = [
+            e for e in kb.list_events(conn, task_id)
+            if e.kind == "completed"
+        ][-1]
+        assert completed.payload["artifacts"] == [str(stored)]
     finally:
         conn.close()
 

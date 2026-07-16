@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import random
@@ -3957,6 +3958,82 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+def _completion_artifact_paths(metadata: Optional[dict]) -> list[str]:
+    """Return non-empty artifact path strings carried by completion metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    artifacts = metadata.get("artifacts")
+    if not isinstance(artifacts, (list, tuple)):
+        return []
+    return [
+        str(path).strip()
+        for path in artifacts
+        if isinstance(path, str) and str(path).strip()
+    ]
+
+
+def _unique_attachment_path(dest_dir: Path, filename: str, source_hint: str) -> Path:
+    """Choose a non-colliding attachment path for a completion artifact."""
+    clean_name = Path(filename).name.strip() or "artifact"
+    dest = dest_dir / clean_name
+    if not dest.exists():
+        return dest
+    digest = hashlib.sha256(source_hint.encode("utf-8")).hexdigest()[:8]
+    stem = dest.stem or "artifact"
+    suffix = dest.suffix
+    candidate = dest_dir / f"{stem}-{digest}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = dest_dir / f"{stem}-{digest}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def _preserve_completion_artifacts(
+    task_id: str,
+    artifact_paths: Iterable[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Copy worker-created artifacts into the durable task attachments store."""
+    preserved: list[dict[str, Any]] = []
+    missing: list[str] = []
+    dest_dir = task_attachments_dir(task_id)
+    for raw_path in artifact_paths:
+        try:
+            src = Path(raw_path).expanduser()
+            if not src.is_absolute():
+                src = src.resolve()
+            if not src.is_file():
+                missing.append(raw_path)
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir_resolved = dest_dir.resolve()
+            src_resolved = src.resolve()
+            if src_resolved.parent == dest_dir_resolved:
+                dest = src_resolved
+            else:
+                dest = _unique_attachment_path(dest_dir, src.name, str(src_resolved))
+                shutil.copy2(src_resolved, dest)
+            stat = dest.stat()
+            preserved.append(
+                {
+                    "filename": dest.name,
+                    "stored_path": str(dest),
+                    "content_type": mimetypes.guess_type(dest.name)[0],
+                    "size": int(stat.st_size),
+                    "source_path": raw_path,
+                }
+            )
+        except Exception as exc:
+            _log.warning(
+                "failed to preserve completion artifact for task %s: %s (%s)",
+                task_id,
+                raw_path,
+                exc,
+            )
+            missing.append(raw_path)
+    return preserved, missing
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -4042,6 +4119,21 @@ def complete_task(
     else:
         verified_cards = []
 
+    artifact_paths = _completion_artifact_paths(metadata)
+    preserved_artifacts, missing_artifacts = _preserve_completion_artifacts(
+        task_id,
+        artifact_paths,
+    )
+    metadata_for_storage = metadata
+    if isinstance(metadata, dict) and artifact_paths:
+        metadata_for_storage = dict(metadata)
+        metadata_for_storage["artifacts"] = [
+            str(artifact["stored_path"]) for artifact in preserved_artifacts
+        ]
+        metadata_for_storage["source_artifacts"] = artifact_paths
+        if missing_artifacts:
+            metadata_for_storage["missing_artifacts"] = missing_artifacts
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4084,7 +4176,7 @@ def complete_task(
             conn, task_id,
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
-            metadata=metadata,
+            metadata=metadata_for_storage,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -4095,7 +4187,36 @@ def complete_task(
                 conn, task_id,
                 outcome="completed",
                 summary=summary if summary is not None else result,
-                metadata=metadata,
+                metadata=metadata_for_storage,
+            )
+        for artifact in preserved_artifacts:
+            conn.execute(
+                "INSERT INTO task_attachments "
+                "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    str(artifact["filename"]),
+                    str(artifact["stored_path"]),
+                    artifact.get("content_type"),
+                    int(artifact["size"]),
+                    None,
+                    now,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "attached",
+                {
+                    "filename": str(artifact["filename"]),
+                    "size": int(artifact["size"]),
+                    "by": None,
+                    "source": "completion_artifact",
+                    "stored_path": str(artifact["stored_path"]),
+                    "source_path": str(artifact["source_path"]),
+                },
+                run_id=run_id,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
@@ -4115,14 +4236,12 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        if preserved_artifacts:
+            completed_payload["artifacts"] = [
+                str(artifact["stored_path"]) for artifact in preserved_artifacts
+            ]
+        if missing_artifacts:
+            completed_payload["missing_artifacts"] = missing_artifacts
         _append_event(
             conn, task_id, "completed",
             completed_payload,
