@@ -118,7 +118,7 @@ Hermes → BlueBubbles REST API → Messages.app → iMessage
 | `BLUEBUBBLES_REQUIRE_MENTION` | No | `false` | Require a mention pattern before responding in group chats |
 | `BLUEBUBBLES_MENTION_PATTERNS` | No | Hermes wake words | JSON array, newline-separated, or comma-separated regex patterns for group mention matching |
 
-Auto-marking messages as read is controlled by the `send_read_receipts` key under `platforms.bluebubbles.extra` in `~/.hermes/config.yaml` (default: `true`). There is no corresponding environment variable.
+Auto-marking messages as read is controlled by the `send_read_receipts` key under `platforms.bluebubbles.extra` in `~/.hermes/config.yaml`, or by `BLUEBUBBLES_SEND_READ_RECEIPTS` (default: `false`). Keep it disabled when preserving native unread state and notifications matters.
 
 ## Features
 
@@ -168,4 +168,3 @@ Without the Private API, basic text messaging and media still work.
 ### "Private API helper not connected"
 - Install the Private API helper: [docs.bluebubbles.app](https://docs.bluebubbles.app/helper-bundle/installation)
 - Basic messaging works without it — only reactions, typing, and read receipts require it
-
